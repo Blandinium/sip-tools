@@ -50,7 +50,7 @@ if [ -d /etc/asterisk ]; then
   ts=$(date +%F-%H%M%S)
   for f in /etc/asterisk/*.conf
   do
-    cp -a "$f" "$f.bak.$ts"
+    sudo cp -a "$f" "$f.bak.$ts"
   done
 fi
 
