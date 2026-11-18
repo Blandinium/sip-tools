@@ -6,7 +6,27 @@ BASE_DIR=/usr/local/src/asterisk
 TARBALL_DIR="$BASE_DIR/tarballs"
 BUILD_DIR="$BASE_DIR/build"
 
-echo "Checking latest Asterisk $AST_MAJOR LTS version..."
+usage() {
+  echo "Usage: $0 [--check]" >&2
+  echo "  --check  only notify if a newer release than the installed one exists" >&2
+  exit 2
+}
+
+CHECK=0
+case "${1-}" in
+  "") ;;
+  --check) CHECK=1 ;;
+  *) usage ;;
+esac
+
+if (( CHECK )); then
+  # Settings for --check, overridable from the environment.
+  NOTIFY_HOOK="${ASTERISK_NOTIFY_HOOK-/usr/local/bin/pushover.sh}"
+  ASTERISK_BIN="${ASTERISK_BIN:-$(command -v asterisk || echo /usr/sbin/asterisk)}"
+  STATE_FILE="${ASTERISK_CHECK_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/update-asterisk/notified}"
+else
+  echo "Checking latest Asterisk $AST_MAJOR LTS version..."
+fi
 
 LATEST=$(
   curl -fsSL https://downloads.asterisk.org/pub/telephony/asterisk/ \
@@ -18,6 +38,35 @@ LATEST=$(
 if [[ -z "$LATEST" ]]; then
   echo "Could not determine latest version"
   exit 1
+fi
+
+if (( CHECK )); then
+  INSTALLED=$("$ASTERISK_BIN" -V | sed -nE 's/^Asterisk ([0-9][0-9.]*).*/\1/p')
+  if [[ -z "$INSTALLED" ]]; then
+    echo "Could not determine installed version from $ASTERISK_BIN -V" >&2
+    exit 1
+  fi
+
+  newest=$(printf '%s\n%s\n' "$INSTALLED" "$LATEST" | sort -V | tail -n1)
+  if [[ "$newest" == "$INSTALLED" ]]; then
+    echo "$(date '+%F %T') Asterisk $INSTALLED is up to date"
+    exit 0
+  fi
+
+  notified=$(cat "$STATE_FILE" 2>/dev/null || true)
+  if [[ "$notified" == "$LATEST" ]]; then
+    echo "$(date '+%F %T') Asterisk $LATEST available (installed $INSTALLED), already notified"
+    exit 0
+  fi
+
+  message="Asterisk $LATEST is available on $(hostname -s) (installed: $INSTALLED)"
+  echo "$(date '+%F %T') $message"
+  if [[ -n "$NOTIFY_HOOK" ]]; then
+    "$NOTIFY_HOOK" "$message" >/dev/null
+  fi
+  mkdir -p "$(dirname "$STATE_FILE")"
+  echo "$LATEST" > "$STATE_FILE"
+  exit 0
 fi
 
 echo "Latest version: $LATEST"
