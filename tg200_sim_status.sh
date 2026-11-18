@@ -1,40 +1,99 @@
 #!/usr/bin/env bash
+# Monitor a Yeastar TG gateway through its web UI: SIM states, SIP trunk status,
+# and reachability. Sends notifications on changes and reboots the gateway when
+# its SIMs are stuck. See README.md for configuration.
 set -euo pipefail
 umask 077
 
+log() {
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*" >&2
+}
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
 read_required_file() {
     local path="$1"
-    if [[ ! -r "$path" ]]; then
-        printf 'Error: required config file not readable: %s\n' "$path" >&2
-        exit 1
-    fi
+    [[ -r "$path" ]] || die "required config file not readable: $path"
     <"$path" tr -d '\r'
 }
 
+# Read KEY=value lines from an optional config file. A setting already given in
+# the environment as YEASTAR_<KEY> takes precedence over the file.
+load_optional_config() {
+    local path="$1" key value env
+    [[ -r "$path" ]] || return 0
+    while IFS='=' read -r key value; do
+        key="${key//[[:space:]]/}"
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        case "$key" in
+            NOTIFY_HOOK|REPEAT_HOURS|SIP_FAIL_RUNS)
+                env="YEASTAR_${key}"
+                [[ -n "${!env+x}" ]] || printf -v "$env" '%s' "$value"
+                ;;
+            *) log "Ignoring unknown setting in ${path}: ${key}" ;;
+        esac
+    done < <(tr -d '\r' < "$path")
+}
+
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/yeastar"
-ID="tg200"
+ID="${YEASTAR_ID:-tg200}"
+load_optional_config "${CONFIG_DIR}/${ID}.conf"
+
 TG_HOST="$(read_required_file "${CONFIG_DIR}/${ID}.host")"
 TG_USER="$(read_required_file "${CONFIG_DIR}/${ID}.user")"
 TG_PASS="$(read_required_file "${CONFIG_DIR}/${ID}.pass")"
-NOTIFY_HOOK="/usr/local/bin/pushover.sh"
+
+# Command called with the message as its argument; empty disables notifications.
+NOTIFY_HOOK="${YEASTAR_NOTIFY_HOOK-/usr/local/bin/pushover.sh}"
+# Repeat a fault notification this often while the fault lasts; 0 disables repeats.
+REPEAT_HOURS="${YEASTAR_REPEAT_HOURS:-6}"
+# Consecutive runs a SIP trunk must be down before notifying.
+SIP_FAIL_RUNS="${YEASTAR_SIP_FAIL_RUNS:-2}"
+
+[[ "$REPEAT_HOURS" =~ ^[0-9]+$ ]] || die "REPEAT_HOURS must be a whole number: $REPEAT_HOURS"
+[[ "$SIP_FAIL_RUNS" =~ ^[1-9][0-9]*$ ]] || die "SIP_FAIL_RUNS must be at least 1: $SIP_FAIL_RUNS"
+REPEAT_SECS=$((REPEAT_HOURS * 3600))
 
 BASE_URL="http://${TG_HOST}"
 LOGIN_URL="${BASE_URL}/cgi/WebCGI?1000"
 TMP_FILES=()
+STATUS_COMM=""
 declare -a SIM_STATUSES=()
 declare -a ERROR_STATUSES=(
     "Registering"
     "NO SIM"
 )
 
-log() {
-    printf '[%s] %s\n' "$(date '+%F %T')" "$*" >&2
-}
-
 notify() {
     if [ -n "$NOTIFY_HOOK" ]
     then
         "$NOTIFY_HOOK" "$*" >/dev/null
+    fi
+}
+
+# A fault is tracked by a marker file that exists while the fault lasts. Its
+# first line holds the start time; each repeat notification appends a line,
+# which also resets the file's mtime, the basis for the next repeat.
+fault_raise() {
+    local marker="$1" message="$2" repeat_message="$3"
+    if [[ ! -f "$marker" ]]; then
+        date >> "$marker"
+        notify "$message"
+    elif (( REPEAT_SECS > 0 )) &&
+         (( $(date +%s) - $(stat -c %Y "$marker") >= REPEAT_SECS )); then
+        date >> "$marker"
+        notify "${repeat_message} (since $(head -n 1 "$marker"))"
+    fi
+}
+
+fault_clear() {
+    local marker="$1" message="$2"
+    if [[ -f "$marker" ]]; then
+        rm -f "$marker"
+        notify "$message"
     fi
 }
 
@@ -139,19 +198,12 @@ login() {
 
     if [[ "$http_code" == "200" ]] && grep -qi '^Set-Cookie:' "$headers_file"; then
         log "Login successful"
-        if [[ -f "${CONFIG_DIR}/${ID}.down" ]]
-        then
-            rm -f "${CONFIG_DIR}/${ID}.down"
-            notify "$ID is available again"
-        fi
+        fault_clear "${CONFIG_DIR}/${ID}.down" "${ID} is available again"
         return 0
     else
         log "Login failed"
-        if [[ ! -f "${CONFIG_DIR}/${ID}.down" ]]
-        then
-            date>> "${CONFIG_DIR}/${ID}.down"
-            notify "Login into ${ID} failed"
-        fi
+        fault_raise "${CONFIG_DIR}/${ID}.down" \
+            "Login into ${ID} failed" "${ID} still unreachable"
         return 1
     fi
 }
@@ -179,8 +231,9 @@ fetch_sims() {
          -H 'Cache-Control: no-cache' \
          -H "Cookie: language=en; loginname=${TG_USER}; password=${ENCODED_PASS}; OsVer=91.3.0.23; current=; TabIndex=0; TabIndexwithback=0; curUrl=; defaultpwd=; Series=; Product=TG100"
 
-    # Extract MyPBX_COMM value
+    # Extract MyPBX_COMM value; check_sip_trunks parses it too
     comm=$(sed -n 's/.*id="MyPBX_COMM" value="\([^"]*\)".*/\1/p' "$body_file")
+    STATUS_COMM="$comm"
 
     # Extract GsmTrunks section
     gsm=$(sed -n 's/.*GsmTrunks:\([^&]*\).*/\1/p' <<< "$comm")
@@ -218,6 +271,51 @@ fetch_sims() {
 
         if [[ "$old_status" != "${SIM_STATUSES[$i]}" ]]; then
             notify "${ID} SIM ${sim_names[$i]} changed from ${old_status} to ${SIM_STATUSES[$i]}"
+        fi
+    done
+}
+
+# The status page lists the gateway's SIP trunks with their qualify result, e.g.
+#   SpTrunks:<name>,SPS,,<server>, OK (13 ms);
+# "OK" means the gateway reaches the SIP server; anything else is a fault.
+check_sip_trunks() {
+    local sp record name status i count count_file marker
+    local -a records fields
+
+    sp=$(sed -n 's/.*SpTrunks:\([^&]*\).*/\1/p' <<< "$STATUS_COMM")
+    IFS=';' read -r -a records <<< "$sp"
+
+    for i in "${!records[@]}"; do
+        record=${records[$i]}
+        [[ -z "$record" ]] && continue
+
+        IFS=',' read -r -a fields <<< "$record"
+        name=${fields[0]:-trunk$((i+1))}
+        status=${fields[4]:-}
+        status="${status#"${status%%[![:space:]]*}"}"   # trim leading space
+        log "SIP trunk ${name}: ${status:-no status}"
+
+        count_file="${CONFIG_DIR}/${ID}.sptrunk$((i+1)).failcount"
+        marker="${CONFIG_DIR}/${ID}.sptrunk$((i+1)).down"
+
+        if [[ "$status" == OK* ]]; then
+            printf '0\n' > "$count_file"
+            fault_clear "$marker" "${ID} SIP trunk ${name} is OK again: ${status}"
+            continue
+        fi
+
+        count=0
+        if [[ -r "$count_file" ]]; then
+            count="$(tr -dc '0-9' < "$count_file")"
+            [[ -n "$count" ]] || count=0
+        fi
+        count=$((count + 1))
+        printf '%s\n' "$count" > "$count_file"
+
+        if (( count >= SIP_FAIL_RUNS )); then
+            fault_raise "$marker" \
+                "${ID} SIP trunk ${name} is down: ${status:-no status}" \
+                "${ID} SIP trunk ${name} still down: ${status:-no status}"
         fi
     done
 }
@@ -286,6 +384,7 @@ error_check() {
 main() {
     login
     fetch_sims
+    check_sip_trunks
     # check the SIM status, if stuck in Initialising, and other sims are not in a call, reboot
     # Ideally, we could just reboot the module of the initializing sim, but then we get stuck in
     # "no sim", so rebooting the whole device seems the only way out in case of errors
