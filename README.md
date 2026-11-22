@@ -58,6 +58,35 @@ REPEAT_HOURS=6
 SIP_FAIL_RUNS=2
 ```
 
+## tg200_clock_watchdog.sh
+Keeps the TG200's clock close to the host's own (NTP-synced) clock. My TG200 has no battery-backed clock and sometimes comes back from a power cut in 1970. With a clock that far off, its OpenVPN client rejects the server certificate and the tunnel stays down.
+
+Each run reads the TG200's time from the `Date` header of its login page, which needs no login. If it is off by more than `MAX_DRIFT_MINUTES`, the script logs in and sets the time on the Date and Time page. The page only takes a time in manual mode, so the script posts that first, then switches NTP back on if it was on, and clicks "Apply Changes". The form has no seconds, so the clock ends up within about 30 seconds. My TG200's NTP client fixes small drift, slowly, but not a clock that is far off; the watchdog covers that case.
+
+The form takes local time. The script doesn't work that out from the timezone name, because the TG200 has its own, older timezone rules, which differ from current ones for some zones. Instead it measures the offset the TG200 itself applies: the Date and Time page shows the TG200's local time, and the HTTP `Date` header of the same response its UTC time. If the clock was far off, that offset can be for the wrong side of a DST change; the script then checks the result, measures again and retries once. If the clock is still wrong, it notifies.
+
+It also notifies when it set the clock, and when it can't reach the web interface (repeated every `REPEAT_HOURS`, with a final message on recovery).
+
+The script needs to reach the TG200's web interface directly, so run it on a host on the same LAN. Use `--dry-run` to log in and show what would be posted, without changing anything.
+
+Run it from cron, e.g. every 15 minutes:
+
+```
+*/15 * * * * /usr/bin/flock -n ~/.cache/tg200_clock_watchdog.lock /bin/bash ~/bin/tg200_clock_watchdog.sh >> ~/tg200_clock_watchdog.log 2>&1
+```
+
+### Configuration
+The same files as `tg200_sim_status.sh`, in `${XDG_CONFIG_HOME:-~/.config}/yeastar/`: `<id>.host`, `<id>.user`, `<id>.pass`, and optionally `<id>.conf`. Settings can also be given as `YEASTAR_<KEY>` environment variables.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `MAX_DRIFT_MINUTES` | `10` | Set the clock when it is off by more than this. |
+| `LAN_SUBNET` | (none) | First three octets of a /24, e.g. `192.168.1`. If set, and the TG200 doesn't answer at the last known address, the script searches this /24 for it (by its web page, not just an open port). `<id>.host` is then optional. |
+| `NOTIFY_HOOK` | `/usr/local/bin/pushover.sh` | Command called with the message as its argument. Empty disables notifications. |
+| `REPEAT_HOURS` | `6` | Repeat fault notifications this often while the fault lasts. `0` disables repeats. |
+
+The address where the TG200 last answered is kept in `<id>.clock.foundhost` and tried first on the next run, then `<id>.host`, then the search. If `<id>.conf` is shared with `tg200_sim_status.sh`, that script logs the keys above as unknown; that is harmless.
+
 ## phone_reachability.sh
 Checks that SIP phones registered with Asterisk (PJSIP) can actually be reached, and sends a notification when one can't. A phone fails the check when:
 - its AOR has no contact in `pjsip show contacts`, or none from the expected host;
