@@ -59,7 +59,7 @@ REPEAT_SECS=$((REPEAT_HOURS * 3600))
 
 BASE_URL="http://${TG_HOST}"
 LOGIN_URL="${BASE_URL}/cgi/WebCGI?1000"
-TMP_FILES=()
+TMP_DIR=""
 STATUS_COMM=""
 declare -a SIM_STATUSES=()
 declare -a ERROR_STATUSES=(
@@ -97,18 +97,19 @@ fault_clear() {
     fi
 }
 
+# Temp files go in one directory per run, removed on exit. Callers use
+# "$(mktemp_tracked)", a subshell, so a list of files kept in a variable would
+# never reach the parent's cleanup.
 cleanup() {
-    if ((${#TMP_FILES[@]})); then
-        rm -f "${TMP_FILES[@]}"
+    if [[ -n "$TMP_DIR" ]]; then
+        rm -rf "$TMP_DIR"
     fi
 }
 trap cleanup EXIT
+TMP_DIR="$(mktemp -d)"
 
 mktemp_tracked() {
-    local f
-    f="$(mktemp)"
-    TMP_FILES+=("$f")
-    printf '%s\n' "$f"
+    mktemp "${TMP_DIR}/XXXXXXXX"
 }
 
 urlencode() {

@@ -88,7 +88,7 @@ FOUND_HOST_FILE="${CONFIG_DIR}/${ID}.clock.foundhost"
 UNREACHABLE_MARKER="${CONFIG_DIR}/${ID}.clock.unreachable"
 FAILED_MARKER="${CONFIG_DIR}/${ID}.clock.failed"
 UA='Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0'
-TMP_FILES=()
+TMP_DIR=""
 BASE_URL=""
 COOKIE=""
 
@@ -122,18 +122,19 @@ fault_clear() {
     fi
 }
 
+# Temp files go in one directory per run, removed on exit. Callers use
+# "$(mktemp_tracked)", a subshell, so a list of files kept in a variable would
+# never reach the parent's cleanup.
 cleanup() {
-    if ((${#TMP_FILES[@]})); then
-        rm -f "${TMP_FILES[@]}"
+    if [[ -n "$TMP_DIR" ]]; then
+        rm -rf "$TMP_DIR"
     fi
 }
 trap cleanup EXIT
+TMP_DIR="$(mktemp -d)"
 
 mktemp_tracked() {
-    local f
-    f="$(mktemp)"
-    TMP_FILES+=("$f")
-    printf '%s\n' "$f"
+    mktemp "${TMP_DIR}/XXXXXXXX"
 }
 
 urlencode() {
