@@ -146,3 +146,126 @@ Example `/etc/cron.d/phone-reachability`, every 5 minutes:
 
 Phones that sleep (Android Doze) can answer pings and SIP OPTIONS slowly or not at all for short periods. If you get false alarms, raise `FAIL_RUNS`, `PING_TIMEOUT` or `qualify_timeout`.
 
+## sms_bridge.py
+
+Requires Linux and Python 3.11 or newer.
+
+Bridges incoming SMS on a Yeastar TG-series gateway to the SIP phone paired
+with that SIM. Authenticated phones can send SMS through their own SIM or
+message each other by extension or by any configured number alias. Local
+messages show the sender's primary number so replies stay local.
+
+The bridge looks up registered UDP contacts over Asterisk AMI and sends SIP
+MESSAGE directly. In Asterisk 22.12.0, `MessageSend` reports submission while
+the phone's final response stays inside Asterisk. The bridge confirms a SIP
+delivery when the phone returns a matching 2xx. It tries contacts marked
+`Unreachable` last.
+
+### Configuration
+
+Copy `examples/sms-bridge.conf` to `/etc/sms-bridge/bridge.conf` and replace
+the example values. Run one bridge instance per gateway. Create a dedicated
+`sms-bridge` system user and group. Give it read access to config and
+credentials (root-owned, group `sms-bridge`, mode 0640). Each credentials file
+contains one `username:password` line. The AMI pair must match the account in
+`examples/manager.conf`. Use trusted private networks for TG API and SIP UDP.
+
+| Section | Setting | Default | Meaning |
+|---|---|---|---|
+| `[bridge]` | `ami_credentials_file` | required | Asterisk AMI credentials file. AMI always connects over IPv4 loopback. |
+| | `ami_port` | `5038` | Local AMI TCP port. |
+| | `sip_domain` | required | SIP domain or address phones use for replies, optionally with port. |
+| | `sip_bind` | route-selected | Local IPv4 or IPv6 address used to send SIP UDP from an ephemeral port. |
+| | `db_path` | `/var/lib/sms-bridge/queue.sqlite3` | SQLite queue path. The service user needs write access to its parent directory. |
+| | `notify_hook` | `/usr/local/bin/pushover.sh` | Executable called with one message argument. Empty disables external notifications. |
+| | `repeat_hours` | `6` | Interval for repeating TG API and AMI outage alerts. Zero disables repeats. A recovery alert follows a successful login. |
+| | `retry_hours` | `6` | Retry window for SIP deliveries, failure replies and SMS waiting for an available gateway. |
+| | `retry_seconds` | `60` | Delay between queue attempts. |
+| | `multipart_seconds` | `120` | Time to wait for remaining inbound SMS parts before delivering with an incomplete marker. |
+| | `api_timeout_seconds` | `10` | Timeout for API login and AMI requests. TCP keepalive detects idle connection loss. |
+| | `send_status_seconds` | `120` | Time to wait for the first TG send status. |
+| | `send_settle_seconds` | `30` | Quiet time after the last successful TG status before clearing the SMS. |
+| | `sip_timeout_seconds` | `8` | Time to wait per UDP contact, including transaction retransmissions. |
+| | `rate_per_hour` | `20` | Maximum admitted outbound SMS per endpoint per rolling hour. |
+| | `rate_per_day` | `100` | Maximum admitted outbound SMS per endpoint per rolling day. |
+| `[gateway ID]` | `host` | required | TG API host on the private network. |
+| | `port` | `5038` | TG API TCP port. |
+| | `credentials_file` | required | TG API credentials file. |
+| | `country_code` | required | International prefix for local numbers, e.g. `+1`. |
+| `[endpoint NAME]` | `gateway` | required | ID of the endpoint's TG gateway. |
+| | `span` | required | TG API span, equal to the SIM slot plus one. Use each span once per gateway. |
+| | `numbers` | required | Unique E.164 aliases separated by commas or spaces, primary first. |
+| | `aor` | endpoint name | PJSIP AOR used to find the phone's contacts. |
+
+Merge the example Asterisk snippets into the existing config. Set
+`message_context=messages` only on the phones with `identify_by=username`,
+inbound digest auth and an auth username matching the endpoint name. The
+bridge relies on Asterisk authenticating the SIP From user against that
+endpoint. It accepts IPv6 hosts in the From URI, including the unbracketed
+form Asterisk emits. The dialplan uses Asterisk's `func_base64` and `app_userevent` modules to
+encode the From header, destination and body and emit the AMI event. Set `message_context=messages-drop` on trunks and
+other untrusted endpoints so MESSAGEs never reach a voice dialplan. Keep AMI
+on loopback with the permissions shown in the example. AMI needs the
+`reporting` write permission for `Getvar`.
+
+Install the script at `/usr/local/lib/sms-bridge/sms_bridge.py` and install
+`examples/sms-bridge.service` as `sms-bridge.service`. The unit creates the
+private state directory. Use an executable notification hook accessible
+inside the service sandbox if you enable it. Reload Asterisk's manager and
+dialplan after merging the snippets, and apply the PJSIP endpoint settings.
+Then enable and start the bridge unit.
+
+### Queue and retries
+
+Messages to each phone are delivered in arrival order, with up to 16 deliveries
+running at once across phones. A message awaiting retry holds back later messages
+until it is delivered or marked failed.
+When a pending SIP delivery is due and its endpoint is no longer configured,
+the bridge marks the message failed or discards it if it is a failure reply.
+It logs either outcome once.
+
+If an AMI or TG API event handler raises an error, including a database
+error, the bridge logs the failure without message text and continues reading
+events on the same connection.
+
+A SIP delivery that reaches its retry deadline stays in the private queue and
+generates one alert. This includes failure replies, which get a fresh window
+when created. List and requeue failed deliveries as the service user or root.
+Each manual retry starts a fresh window.
+
+```sh
+sudo -u sms-bridge /usr/local/lib/sms-bridge/sms_bridge.py list
+sudo -u sms-bridge /usr/local/lib/sms-bridge/sms_bridge.py retry 42
+sudo -u sms-bridge /usr/local/lib/sms-bridge/sms_bridge.py retry
+```
+
+Numbers can begin with `+`, `00`, or a national leading zero. The bridge strips
+spaces. Incoming texts from alphanumeric senders and short codes show their
+sender ID as the display name. The bridge refuses replies to those IDs. Avoid reusing their identifiers as
+local extension names. The rolling rate limit counts admitted outbound SMS,
+including queued or failed sends, and excludes local delivery.
+
+The bridge sends each SMS once. Any failed part triggers a reply from the
+original destination. A missing first status produces an uncertain-outcome
+reply. After a successful status the gateway can send the next SMS while
+the bridge waits for any further parts' statuses.
+
+The bridge URL-encodes outgoing text. It accepts tabs and line breaks and
+normalises CRLF and lone CR to LF. It refuses other control characters.
+It encodes supplementary characters such as emoji as CESU-8 surrogate pairs
+for the gateway. Very long encoded SMS still need live testing to establish
+the gateway's limit.
+
+Incoming multipart SMS is assembled in part order. A leading encoded BOM
+marks UTF-8. Without it, the bridge decodes the text as ISO-8859-15.
+GSM-7 Greek capitals remain untested. The gateway drops emoji from incoming
+SMS. If no text remains, the bridge delivers a placeholder explaining the loss.
+
+The queue stores no delivered message history. Logs and alerts include routing
+metadata and omit message text. The API and AMI only deliver events while
+connected, so events emitted during an outage may be lost. Multipart SMS
+without a gateway reference can be ambiguous when two messages from the same
+sender arrive together.
+
+Run the local tests against loopback mocks with
+`python3 -m unittest discover -s tests -v`.

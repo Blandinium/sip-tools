@@ -1,0 +1,39 @@
+[Unit]
+Description=TG200 SMS and SIP MESSAGE bridge
+Wants=network-online.target
+After=network-online.target asterisk.service
+
+[Service]
+Type=simple
+User=sms-bridge
+Group=sms-bridge
+StateDirectory=sms-bridge
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/python3 -I /usr/local/lib/sms-bridge/sms_bridge.py --config /etc/sms-bridge/bridge.conf
+Restart=always
+RestartSec=5s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target
